@@ -4,6 +4,7 @@ from utils import *
 
 import imageio
 from PIL import Image
+from io import BytesIO
 import matplotlib.pyplot as plt
 
 class Preprocess(tf.keras.layers.Layer):
@@ -16,12 +17,14 @@ class Preprocess(tf.keras.layers.Layer):
     - Besides, it might be hard for the model to account for different modalities sampled at different
         timesteps.
     '''
-    def __init__(self, interpolated_length=10):
+    def __init__(self, interpolated_length=10, do_angles=True):
         super(Preprocess, self).__init__()
         self.fixed_frames = interpolated_length
+        self.do_angles = do_angles
 
         self.mod2indexes = {
-            "pose": tf.constant([468, 500, 501, 502, 503, 522]), 
+            # "pose": tf.constant([468, 500, 501, 502, 503, 522]), 
+            "pose": tf.constant([504, 500, 501, 502, 503, 505]), 
             "hands": tf.constant([
                 [468, 469, 470, 471, 472, 473, 474, 475, 476, 477, 478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488], 
                 [522, 523, 524, 525, 526, 527, 528, 529, 530, 531, 532, 533, 534, 535, 536, 537, 538, 539, 540, 541, 542]
@@ -50,7 +53,7 @@ class Preprocess(tf.keras.layers.Layer):
                 [18, 30, 24, 25, 26, 27, 28, 31, 17, 16, 29, 19, 20, 21, 22, 23, 18]
             ]),
             "mouth": np.array([
-                [2, 10, 3, 4, 5, 0, 14, 13, 12, 19, 11, 17, 16, 18, 15, 1, 6, 9, 7, 8]
+                [2, 10, 3, 4, 5, 0, 14, 13, 12, 19, 11, 17, 16, 18, 15, 1, 6, 9, 7, 8, 2]
             ])
         }
 
@@ -64,7 +67,6 @@ class Preprocess(tf.keras.layers.Layer):
     @tf.function
     def pad_or_truncate_center(self, tensor, fixed_length):
         seq_length = tf.shape(tensor)[0]
-        
         if seq_length > fixed_length:
             # Truncate the sequence by selecting the center patch
             start_idx = (seq_length - fixed_length) // 2
@@ -74,14 +76,13 @@ class Preprocess(tf.keras.layers.Layer):
             padding_length = fixed_length - seq_length
             padding = tf.zeros((padding_length, tf.shape(tensor)[1], tf.shape(tensor)[2]))
             tensor = tf.concat([tensor, padding], axis=0)
-
         return tensor
 
     def call(self, tensor):
         tensor = tensor[:, :, :2]  # drop z axis
         do_symetry = (tf.reduce_mean(tf.cast(tf.math.is_nan(tensor[:, self.rh_idx_range[0]:self.rh_idx_range[1], :]), tf.float32))
                     < tf.reduce_mean(tf.cast(tf.math.is_nan(tensor[:, self.lh_idx_range[0]:self.lh_idx_range[1], :]), tf.float32)))
-        
+
         tensor = tf.cond(# symetry on 2nd axis when left-handed
             tf.equal(do_symetry, True),
             lambda: tf.stack([1 - tensor[:, :, 0], tensor[:, :, 1]], axis=-1),
@@ -91,7 +92,6 @@ class Preprocess(tf.keras.layers.Layer):
         modalities, mod_indexes = {}, {}
         for modality, modalitidx in self.mod2indexes.items():
             mod_tensor = tf.gather(tensor, modalitidx, axis=1)
-            fallback_shape = tf.shape(mod_tensor)
             
             if modality == "pose":
                 mod_tensor = tf.cond(
@@ -99,12 +99,14 @@ class Preprocess(tf.keras.layers.Layer):
                     lambda: mod_tensor[:, 1:],
                     lambda: mod_tensor[:, :-1]
                 )
+
             if modality == "hands":
                 mod_tensor = tf.cond(
                     tf.equal(do_symetry, True),
                     lambda: mod_tensor[:, 1],
                     lambda: mod_tensor[:, 0]
                 )
+                mod_tensor = mod_tensor - mod_tensor[0]
 
             nan_frames_mask = tf.reduce_all(tf.math.is_nan(mod_tensor), axis=[1, 2])
             nan_frames_mask = tf.reshape(nan_frames_mask, [-1])
@@ -112,6 +114,9 @@ class Preprocess(tf.keras.layers.Layer):
             mod_tensor = tf.boolean_mask(mod_tensor, tf.math.logical_not(nan_frames_mask), axis=0)
             mod_tensor = tf.where(tf.math.is_nan(mod_tensor), tf.zeros_like(mod_tensor), mod_tensor)
             mod_tensor = self.pad_or_truncate_center(mod_tensor, self.fixed_frames)
+
+            if self.do_angles:
+                mod_tensor = tf.math.atan2(mod_tensor[:, :, 0], mod_tensor[:, :, 1])
 
             modalities[modality] = mod_tensor
             # mod_indexes[modality] = mod_time_interpolated #time index
@@ -127,52 +132,44 @@ class Preprocess(tf.keras.layers.Layer):
             plt.plot(array[seg, 0], -array[seg, 1], '-', color=col, linewidth=width)    
         
     def output_gif_result(self, tensor, out_path='untitled.gif', gif_size=(224, 224)):
-        is_right_handed = (tf.reduce_mean(tf.cast(tf.math.is_nan(tensor[0, self.rh_idx_range[0]:self.rh_idx_range[1], :2]), tf.float32)) 
-                        < tf.reduce_mean(tf.cast(tf.math.is_nan(tensor[0, self.lh_idx_range[0]:self.lh_idx_range[1], :2]), tf.float32)))
-        
-        mod2tensor = self.call(tensor)[0]
-        mod2tensor = {k:v.numpy() for k,v in mod2tensor.items()}
 
-        for pose, hands in zip(mod2tensor['pose'], mod2tensor['hands']):
-            if is_right_handed:
-                pose[-1] = hands[0]
-                self.mod2edge["pose"] = self.mod2edge["pose"][:1]
-            else:
-                pose[0] = hands[0]
-                self.mod2edge["pose"] = self.mod2edge["pose"][-1:]
+        #test if the signer is left_handed
+        tensor = tensor[:, :, :2]  # drop z axis
+        is_left_handed = (tf.reduce_mean(tf.cast(tf.math.is_nan(tensor[:, self.rh_idx_range[0]:self.rh_idx_range[1], :]), tf.float32))
+                    < tf.reduce_mean(tf.cast(tf.math.is_nan(tensor[:, self.lh_idx_range[0]:self.lh_idx_range[1], :]), tf.float32))).numpy()
+        
+        mod2tensor = self.call(tensor)
+        sequence_length = mod2tensor['hands'].shape[0]
 
         images = []
+        for t in range(sequence_length):
+            mod2tensor_t = {k:v[t].numpy() for k,v in mod2tensor.items()}
+            # break
+            fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+            axes = axes.flatten()
 
-        times = [{} for _ in range(self.fixed_frames)]
-        for mod, arrays in mod2tensor.items():
-            for t, array in enumerate(arrays):
-                times[t][mod] = array
-
-        for i, time in enumerate(times):
-            plt.figure(figsize=(gif_size[0]/100, gif_size[1]/100))
-            for modality in time.keys():
+            for idx, (modality, array) in enumerate(mod2tensor_t.items()):
+                
                 modalitidx = self.mod2edge[modality]
-                col, width = self.mod2style[modality]
-                array = time[modality]
+                if modality == 'pose':
+                    modalitidx = [self.mod2edge['pose'][1-int(is_left_handed)]]
+
                 for j, seg in enumerate(modalitidx):
                     seg = np.array(seg)
-                    plt.plot(array[seg, 0], -array[seg, 1], '-', color=col, linewidth=width)
-            plt.xlim(-0.25, 1.25)
-            plt.ylim(-1.5, 0)
-            plt.axis('off')
-            plt.gca().set_position([0, 0, 1, 1])
-            plt.savefig(f"tmp/frame_{i:02d}.png")
-            plt.close()
-            images.append(Image.open(f"tmp/frame_{i:02d}.png"))
+                    axes[idx].plot(array[seg, 0], -array[seg, 1], '-')
+                    axes[idx].plot(array[seg, 0], -array[seg, 1], 'yo')
+                axes[idx].set_title(modality)
 
-        images[0].save(
-            out_path,
-            save_all=True,
-            append_images=images[1:],
-            duration=100,
-            loop=0,
-            size=gif_size)
+            # Save the figure to a buffer
+            buf = BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            im = Image.open(buf)
+            images.append(im)
+            plt.close()
         
+        plt.suptitle('Test')
+
         # Save the images as a GIF file
         imageio.mimsave(out_path, images, fps=5)
         return out_path
